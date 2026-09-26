@@ -184,3 +184,97 @@ class ShareSubmitOut(BaseModel):
     completed: bool
     wrap: dict | None = None
     aad: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# 跨策略密钥迁移
+# ---------------------------------------------------------------------------
+
+class MigrationStartIn(BaseModel):
+    custody_id: str
+    target_policy_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9._-]+$")
+    target_expected_version: int = Field(ge=1)
+    # 幂等键：同键同参重放返回同一会话；异键不得重复迁移同一托管记录
+    idempotency_key: str = Field(pattern=r"^[a-zA-Z0-9._:-]{8,128}$")
+    ttl_seconds: int | None = Field(default=None, ge=10, le=600)
+
+
+class MigrationSessionOut(BaseModel):
+    migration_id: str
+    custody_id: str
+    idempotency_key: str
+    source_policy_id: str
+    source_policy_version: int
+    source_policy_digest: str
+    target_policy_id: str
+    target_policy_version: int
+    target_policy_digest: str
+    status: str                 # open | completed | failed
+    fail_reason: str | None = None
+    shares_received: int
+    threshold: int              # 源策略门限
+    result_custody_id: str | None = None
+    valid_until: datetime
+    created_at: datetime
+
+
+class MigrationChallengeIn(BaseModel):
+    migration_id: str
+
+
+class MigrationChallengeOut(BaseModel):
+    challenge_id: str
+    nonce: str
+    migration_id: str
+    custodian_id: str
+    source_policy_id: str
+    source_policy_version: int
+    target_policy_id: str
+    target_policy_version: int
+    point_x: int
+    shard_digest: str
+    next_step: str = "claim your shard at POST /migrations/shards/claim, then sign signing_message and POST /migrations/shares"
+
+
+class MigrationShardClaimIn(BaseModel):
+    migration_id: str
+    nonce: str = Field(pattern=_HEX32)
+
+
+class MigrationShardClaimOut(BaseModel):
+    migration_id: str
+    challenge_id: str
+    custodian_id: str
+    custody_id: str
+    point_x: int
+    shard_digest: str
+    # 本人分片明文（仅在本次 HTTPS 响应中出现；服务端从不记录它）
+    shard_hex: str
+    # 待签名报文：绑定 挑战值/会话/托管记录/源目标版本摘要/点位/分片摘要
+    signing_message: str
+
+
+class MigrationShareSubmitIn(BaseModel):
+    migration_id: str
+    nonce: str = Field(pattern=_HEX32)
+    point_x: int = Field(ge=1, le=65535)
+    shard_hex: str = Field(min_length=2, max_length=8512)
+    signature: str = Field(pattern=_HEX_SIG)
+
+    @field_validator("shard_hex")
+    @classmethod
+    def _hex(cls, v: str) -> str:
+        if not re.fullmatch(_HEX_EVEN, v) or len(v) % 2 != 0:
+            raise ValueError("shard_hex must be even-length hex (optional 0x prefix)")
+        return v.removeprefix("0x").removeprefix("0X")
+
+
+class MigrationShareSubmitOut(BaseModel):
+    migration_id: str
+    status: str
+    shares_received: int
+    threshold: int
+    completed: bool
+    # 达到源门限的那一次返回：新托管记录标识与各分片摘要（绝不含明文）
+    result_custody_id: str | None = None
+    new_custody: dict | None = None

@@ -15,7 +15,14 @@ Verifies:
      session must not evict already-committed in-memory shares; interleaved
      replays and legitimate submits keep db count and memory in agreement;
      the wrapped ciphertext is returned exactly once
-  6. audit hash-chain replay valid and contains no secret material
+  6. cross-policy migration: idempotent session create (same key replays,
+     different keys never duplicate-migrate), one-time challenge + signed
+     shard submission binding source/target version digests, in-memory
+     reconstruction + immediate re-shard under the target policy in one
+     transaction, source custody untouched, mid-session rotation fails the
+     session and a fresh idempotency key retries safely, concurrent
+     duplicate create/submit rejected deterministically
+  7. audit hash-chain replay valid and contains no secret material
 """
 from __future__ import annotations
 
@@ -38,6 +45,7 @@ from cryptography.hazmat.primitives import hashes
 
 from app.seed import demo_credentials
 from app.crypto import custodian_signing_message as crypto_signing_message
+from app.crypto import migration_signing_message as crypto_mig_signing_message
 
 BASE = os.environ.get("KEYVAULT_BASE_URL", "http://localhost:8000")
 PASS, FAIL = "PASS", "FAIL"
@@ -108,6 +116,7 @@ async def main() -> int:
     cuds = {c["name"]: Client(c["name"], c["api_key"]) for c in creds["custodians"]}
     ckeys = {c["name"]: c for c in creds["custodians"]}
     admin = Client("admin", creds["admin_api_key"])
+    extra_clients: list[Client] = []
 
     try:
         # 每次运行使用唯一策略后缀，保证脚本在持久库上可重复执行
@@ -463,6 +472,404 @@ async def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 check("regression: interleaved unwrap == secret", False, repr(exc))
 
+        # ================= 跨策略密钥迁移 =================
+        pol_mig_src = f"pol_mig_src_{suffix}"
+        pol_mig_tgt = f"pol_mig_tgt_{suffix}"
+        pol_mig_rev = f"pol_mig_rev_{suffix}"
+        pol_mig_exp = f"pol_mig_exp_{suffix}"
+        mig_secret = b"migration-secret-7f3a91c20486bde51029aa66ff01"
+        mig_secret2 = b"migration-secret-retry-55aa11bb22cc33dd44e"
+        epoch_mig = {"valid_from": "2026-01-01T00:00:00Z", "valid_until": "2032-01-01T00:00:00Z",
+                     "rotation_interval": 0}
+
+        # 目标策略包含源策略之外的托管人 dave（证明按目标策略重新分片）
+        r = await admin.call("POST", "/admin/custodians", json={"name": f"dave-{suffix}"})
+        dave = r.json()
+        check("migration: admin registers dave", r.status_code == 201, r.text)
+        dave_cli = Client("dave", dave["api_key"])
+        extra_clients.append(dave_cli)
+        mig_cuds = {**cuds, "dave": dave_cli}
+        mig_keys = {**ckeys, "dave": dave}
+
+        r = await tenant.call("POST", "/policies", json={
+            "policy_id": pol_mig_src, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": epoch_mig})
+        assert r.status_code == 201, r.text
+        r = await tenant.call("POST", "/policies", json={
+            "policy_id": pol_mig_tgt, "threshold": 2,
+            "custodian_ids": ["cus_demo_bob", "cus_demo_carol", dave["custodian_id"]],
+            "epoch": epoch_mig})
+        assert r.status_code == 201, r.text
+        r = await tenant.call("POST", "/custodies", json={
+            "policy_id": pol_mig_src, "expected_version": 1, "secret_hex": mig_secret.hex()})
+        mig_c1 = r.json()["custody_id"]
+        check("migration: source custody created", r.status_code == 201, r.text)
+        r = await tenant.call("POST", "/custodies", json={
+            "policy_id": pol_mig_src, "expected_version": 1, "secret_hex": mig_secret.hex()})
+        mig_c0 = r.json()["custody_id"]  # 专用于创建期负向用例（不挂任何会话）
+
+        async def mig_challenge(name, mid):
+            return await mig_cuds[name].call("POST", "/migrations/challenges",
+                                             json={"migration_id": mid})
+
+        async def mig_prep(name, mid):
+            n = (await mig_challenge(name, mid)).json()
+            c = (await mig_cuds[name].call("POST", "/migrations/shards/claim",
+                                           json={"migration_id": mid, "nonce": n["nonce"]})).json()
+            payload = {"migration_id": mid, "nonce": n["nonce"], "point_x": c["point_x"],
+                       "shard_hex": c["shard_hex"],
+                       "signature": sign(mig_keys[name]["signing_private_key"],
+                                         c["signing_message"])}
+            return payload, c
+
+        async def mig_submit(name, payload):
+            return await mig_cuds[name].call("POST", "/migrations/shares", json=payload)
+
+        async def rec_prep_any(name, sid):
+            n = (await mig_cuds[name].call("POST", "/recoveries/nonces",
+                                           json={"session_id": sid})).json()
+            c = (await mig_cuds[name].call("POST", "/recoveries/shards/claim",
+                                           json={"session_id": sid, "nonce": n["nonce"]})).json()
+            return {"session_id": sid, "nonce": n["nonce"], "point_x": c["point_x"],
+                    "shard_hex": c["shard_hex"],
+                    "signature": sign(mig_keys[name]["signing_private_key"],
+                                      c["signing_message"])}
+
+        # --- 创建：幂等键 + 源/目标版本摘要绑定 ------------------------------
+        mig_key1 = f"mig-key-{suffix}-0001"
+        r = await tenant.call("POST", "/migrations", json={
+            "custody_id": mig_c1, "target_policy_id": pol_mig_tgt,
+            "target_expected_version": 1, "idempotency_key": mig_key1})
+        m1 = r.json()
+        check("migration: session created (201, open, version digests bound)",
+              r.status_code == 201 and m1["status"] == "open" and m1["threshold"] == 2
+              and m1["source_policy_id"] == pol_mig_src and m1["source_policy_version"] == 1
+              and m1["target_policy_id"] == pol_mig_tgt and m1["target_policy_version"] == 1
+              and len(m1["source_policy_digest"]) == 64
+              and len(m1["target_policy_digest"]) == 64, r.text)
+        mid1 = m1["migration_id"]
+
+        # 同键同参重放 -> 200 返回同一会话（安全重试创建）
+        r = await tenant.call("POST", "/migrations", json={
+            "custody_id": mig_c1, "target_policy_id": pol_mig_tgt,
+            "target_expected_version": 1, "idempotency_key": mig_key1})
+        check("migration: idempotent replay returns same session (200)",
+              r.status_code == 200 and r.json()["migration_id"] == mid1, r.text)
+
+        # 同键异参 -> 409（幂等键不得挪用到别的迁移参数）
+        await expect_error(tenant, "migration: same key different params", "POST", "/migrations",
+                           "MIGRATION_CONFLICT", json={
+                               "custody_id": mig_c1, "target_policy_id": pol_main,
+                               "target_expected_version": 1, "idempotency_key": mig_key1})
+
+        # 不同幂等键 -> 进行中的会话冲突（不得重复迁移）
+        await expect_error(tenant, "migration: different key while open", "POST", "/migrations",
+                           "MIGRATION_CONFLICT", json={
+                               "custody_id": mig_c1, "target_policy_id": pol_mig_tgt,
+                               "target_expected_version": 1, "idempotency_key": f"mig-key-{suffix}-0002"})
+
+        # 创建期负向：版本乐观锁 / 跨租户 / 未知记录
+        await expect_error(tenant, "migration: stale target version", "POST", "/migrations",
+                           "VERSION_CONFLICT", json={
+                               "custody_id": mig_c0, "target_policy_id": pol_mig_tgt,
+                               "target_expected_version": 99, "idempotency_key": f"mig-key-{suffix}-v99"})
+        r = await admin.call("POST", "/admin/tenants", json={"name": f"mig-other-{suffix}"})
+        other_tenant = Client("other", r.json()["api_key"])
+        extra_clients.append(other_tenant)
+        await expect_error(other_tenant, "migration: cross-tenant custody", "POST", "/migrations",
+                           "FORBIDDEN", json={
+                               "custody_id": mig_c1, "target_policy_id": pol_mig_tgt,
+                               "target_expected_version": 1, "idempotency_key": f"mig-key-{suffix}-o1"})
+        r = await other_tenant.call("POST", "/policies", json={
+            "policy_id": f"pol_other_{suffix}", "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": epoch_mig})
+        assert r.status_code == 201, r.text
+        await expect_error(tenant, "migration: cross-tenant target policy", "POST", "/migrations",
+                           "FORBIDDEN", json={
+                               "custody_id": mig_c0, "target_policy_id": f"pol_other_{suffix}",
+                               "target_expected_version": 1, "idempotency_key": f"mig-key-{suffix}-xt"})
+        await expect_error(tenant, "migration: unknown custody", "POST", "/migrations",
+                           "NOT_FOUND", json={
+                               "custody_id": "cus_secret_nope", "target_policy_id": pol_mig_tgt,
+                               "target_expected_version": 1, "idempotency_key": f"mig-key-{suffix}-nf"})
+
+        # --- 托管人：挑战值 -> 领取 -> 签名 -> 提交 ---------------------------
+        # 非源策略成员（dave）连挑战值都拿不到
+        await expect_error(dave_cli, "migration: outsider challenge", "POST",
+                           "/migrations/challenges", "CROSS_POLICY_SHARE",
+                           json={"migration_id": mid1})
+
+        pa1, claim_a1 = await mig_prep("alice", mid1)
+        check("migration: signing message binds migration + both version digests",
+              "keyvault.migration.share.v1" in claim_a1["signing_message"]
+              and f"migration={mid1}" in claim_a1["signing_message"]
+              and f"custody={mig_c1}" in claim_a1["signing_message"]
+              and f"source_digest={m1['source_policy_digest']}" in claim_a1["signing_message"]
+              and f"target_digest={m1['target_policy_digest']}" in claim_a1["signing_message"])
+        # 未花费挑战值可重复领取（幂等，返回同一片）
+        c_again = (await cuds["alice"].call("POST", "/migrations/shards/claim", json={
+            "migration_id": mid1, "nonce": pa1["nonce"]})).json()
+        check("migration: claim idempotent before spend",
+              c_again["shard_hex"] == claim_a1["shard_hex"]
+              and c_again["signing_message"] == claim_a1["signing_message"])
+        # 重复领挑战值 -> NONCE_ALREADY_USED
+        await expect_error(cuds["alice"], "migration: re-request challenge", "POST",
+                           "/migrations/challenges", "NONCE_ALREADY_USED",
+                           json={"migration_id": mid1})
+        # 错签名 / 错点位 / 篡改分片：确定性拒绝且不花费挑战值
+        await expect_error(cuds["alice"], "migration: bad signature", "POST", "/migrations/shares",
+                           "BAD_SIGNATURE", json={**pa1, "signature": "00" * 64})
+        await expect_error(cuds["alice"], "migration: wrong point", "POST", "/migrations/shares",
+                           "SHARE_POINT_MISMATCH", json={**pa1, "point_x": pa1["point_x"] + 1})
+        blob = bytearray(bytes.fromhex(pa1["shard_hex"]))
+        blob[0] ^= 0x01
+        await expect_error(cuds["alice"], "migration: tampered shard", "POST", "/migrations/shares",
+                           "SHARE_DIGEST_MISMATCH", json={**pa1, "shard_hex": blob.hex()})
+        # 用别的迁移的签名报文重放（绑定校验）：伪造报文也过不了库存摘要
+        forged = crypto_mig_signing_message(
+            nonce=pa1["nonce"], migration_id=mid1, custody_id=mig_c1,
+            source_policy_id=pol_mig_src, source_policy_version=1,
+            target_policy_id=pol_mig_tgt, target_policy_version=1,
+            source_policy_digest=m1["source_policy_digest"],
+            target_policy_digest="00" * 32,  # 错误的目标摘要
+            custodian_id="cus_demo_alice", point_x=pa1["point_x"],
+            shard_digest=claim_a1["shard_digest"])
+        await expect_error(cuds["alice"], "migration: signature over wrong target digest", "POST",
+                           "/migrations/shares", "BAD_SIGNATURE", json={
+                               **pa1, "signature": sign(ckeys["alice"]["signing_private_key"],
+                                                        forged)})
+
+        r = await mig_submit("alice", pa1)
+        check("migration: alice share accepted (1/2), no new custody yet",
+              r.status_code == 200 and r.json()["shares_received"] == 1
+              and not r.json()["completed"] and r.json()["result_custody_id"] is None, r.text)
+        # 重放已花费挑战值 / 持已花费挑战值再领片
+        await expect_error(cuds["alice"], "migration: replay spent challenge", "POST",
+                           "/migrations/shares", "NONCE_ALREADY_USED", json=pa1)
+        await expect_error(cuds["alice"], "migration: claim with spent challenge", "POST",
+                           "/migrations/shards/claim", "NONCE_ALREADY_USED",
+                           json={"migration_id": mid1, "nonce": pa1["nonce"]})
+
+        pb1, _ = await mig_prep("bob", mid1)
+        r = await mig_submit("bob", pb1)
+        mb = r.json()
+        check("migration: bob share -> source threshold met, new custody id returned",
+              r.status_code == 200 and mb["completed"] and mb["status"] == "completed"
+              and mb["result_custody_id"] and mb["new_custody"]["shard_count"] == 3
+              and len(mb["new_custody"]["shard_digests"]) == 3
+              and all(len(d) == 64 for d in mb["new_custody"]["shard_digests"]), r.text)
+        check("migration: completion response carries no plaintext",
+              mig_secret.hex() not in r.text and mig_secret.decode() not in r.text)
+        new_custody1 = mb["result_custody_id"]
+        check("migration: new custody bound to target policy version",
+              mb["new_custody"]["policy_id"] == pol_mig_tgt
+              and mb["new_custody"]["policy_version"] == 1
+              and mb["new_custody"]["secret_digest"] == hashlib.sha256(mig_secret).hexdigest())
+
+        r = await tenant.call("GET", f"/migrations/{mid1}")
+        check("migration: GET shows completed + result custody id",
+              r.json()["status"] == "completed" and r.json()["shares_received"] == 2
+              and r.json()["result_custody_id"] == new_custody1, r.text)
+        await expect_error(other_tenant, "migration: cross-tenant get", "GET",
+                           f"/migrations/{mid1}", "FORBIDDEN")
+
+        # 新托管记录可按目标策略正常恢复（bob/carol/dave 的 2-of-3），内容一致
+        r = await tenant.call("POST", "/recoveries", json={
+            "custody_id": new_custody1,
+            "request_digest": hashlib.sha256(b"mig-verify-target").hexdigest(),
+            "recovery_public_key": wrap_pub})
+        s_mig = r.json()["session_id"]
+        pc_m = await rec_prep_any("carol", s_mig)
+        pd_m = await rec_prep_any("dave", s_mig)
+        r = await mig_cuds["carol"].call("POST", "/recoveries/shares", json=pc_m)
+        assert r.status_code == 200, r.text
+        r = await mig_cuds["dave"].call("POST", "/recoveries/shares", json=pd_m)
+        mv = r.json()
+        check("migration: new custody recoverable under target policy",
+              r.status_code == 200 and mv["completed"] and mv["wrap"] is not None, r.text)
+        try:
+            check("migration: migrated secret == original",
+                  unwrap(wrap_priv, mv["wrap"], mv["aad"]) == mig_secret)
+        except Exception as exc:  # noqa: BLE001
+            check("migration: migrated secret == original", False, repr(exc))
+
+        # 源托管记录保持不变：仍可按源策略恢复同一秘密
+        r = await tenant.call("POST", "/recoveries", json={
+            "custody_id": mig_c1,
+            "request_digest": hashlib.sha256(b"mig-src-unchanged").hexdigest(),
+            "recovery_public_key": wrap_pub})
+        s_src = r.json()["session_id"]
+        pa_s = await rec_prep_any("alice", s_src)
+        pb_s = await rec_prep_any("bob", s_src)
+        r = await mig_cuds["alice"].call("POST", "/recoveries/shares", json=pa_s)
+        assert r.status_code == 200, r.text
+        r = await mig_cuds["bob"].call("POST", "/recoveries/shares", json=pb_s)
+        ms = r.json()
+        try:
+            src_ok = ms["completed"] and unwrap(wrap_priv, ms["wrap"], ms["aad"]) == mig_secret
+        except Exception:  # noqa: BLE001
+            src_ok = False
+        check("migration: source custody unchanged & still recoverable",
+              r.status_code == 200 and src_ok, r.text)
+
+        # 完成后：不同幂等键不得重复迁移；会话上任何后续操作被拒
+        await expect_error(tenant, "migration: different key after completion", "POST",
+                           "/migrations", "MIGRATION_CONFLICT", json={
+                               "custody_id": mig_c1, "target_policy_id": pol_mig_tgt,
+                               "target_expected_version": 1,
+                               "idempotency_key": f"mig-key-{suffix}-0003"})
+        await expect_error(cuds["carol"], "migration: challenge on completed", "POST",
+                           "/migrations/challenges", "SESSION_COMPLETED",
+                           json={"migration_id": mid1})
+
+        # --- 会话进行中目标策略被轮换：提交被拒 -> 判失败 -> 新幂等键安全重试 --
+        r = await tenant.call("POST", "/custodies", json={
+            "policy_id": pol_mig_src, "expected_version": 1, "secret_hex": mig_secret2.hex()})
+        mig_c2 = r.json()["custody_id"]
+        r = await tenant.call("POST", "/migrations", json={
+            "custody_id": mig_c2, "target_policy_id": pol_mig_tgt,
+            "target_expected_version": 1, "idempotency_key": f"mig-key-{suffix}-0004"})
+        mid2 = r.json()["migration_id"]
+        check("migration(rotate): session created on target v1", r.status_code == 201, r.text)
+        pa2, _ = await mig_prep("alice", mid2)
+        pb2, _ = await mig_prep("bob", mid2)  # 轮换前领好挑战值与分片
+        r = await mig_submit("alice", pa2)
+        check("migration(rotate): alice share accepted before rotation (1/2)",
+              r.status_code == 200 and r.json()["shares_received"] == 1, r.text)
+        r = await tenant.call("POST", f"/policies/{pol_mig_tgt}/rotate", json={
+            "expected_version": 1,
+            "epoch": {"valid_from": "2026-06-01T00:00:00Z", "valid_until": "2033-01-01T00:00:00Z",
+                      "rotation_interval": 0}})
+        check("migration(rotate): target policy rotated to v2 mid-session",
+              r.status_code == 200 and r.json()["version"] == 2, r.text)
+        r = await mig_submit("bob", pb2)
+        check("migration(rotate): submit after target rotation -> EPOCH_REVOKED",
+              r.status_code == 409 and r.json()["error"]["code"] == "EPOCH_REVOKED", r.text)
+        # 新幂等键重试：旧会话被确定性判失败（可重放审计），新会话放行
+        r = await tenant.call("POST", "/migrations", json={
+            "custody_id": mig_c2, "target_policy_id": pol_mig_tgt,
+            "target_expected_version": 2, "idempotency_key": f"mig-key-{suffix}-0005"})
+        m3 = r.json()
+        check("migration(rotate): retry with fresh key -> 201 on target v2",
+              r.status_code == 201 and m3["target_policy_version"] == 2, r.text)
+        r = await tenant.call("GET", f"/migrations/{mid2}")
+        check("migration(rotate): stale session marked failed (replayable audit)",
+              r.json()["status"] == "failed"
+              and r.json()["fail_reason"] == "target_policy_revoked", r.text)
+        pa3, _ = await mig_prep("alice", m3["migration_id"])
+        pb3, _ = await mig_prep("bob", m3["migration_id"])
+        r = await mig_submit("alice", pa3)
+        assert r.status_code == 200, r.text
+        r = await mig_submit("bob", pb3)
+        mb4 = r.json()
+        check("migration(rotate): retried migration completes on v2",
+              r.status_code == 200 and mb4["completed"]
+              and mb4["new_custody"]["policy_version"] == 2, r.text)
+        r = await tenant.call("POST", "/recoveries", json={
+            "custody_id": mb4["result_custody_id"],
+            "request_digest": hashlib.sha256(b"mig-retry-verify").hexdigest(),
+            "recovery_public_key": wrap_pub})
+        s_mig2 = r.json()["session_id"]
+        pc_m2 = await rec_prep_any("carol", s_mig2)
+        pd_m2 = await rec_prep_any("dave", s_mig2)
+        r = await mig_cuds["carol"].call("POST", "/recoveries/shares", json=pc_m2)
+        assert r.status_code == 200, r.text
+        r = await mig_cuds["dave"].call("POST", "/recoveries/shares", json=pd_m2)
+        mv2 = r.json()
+        try:
+            retry_ok = mv2["completed"] and unwrap(wrap_priv, mv2["wrap"], mv2["aad"]) == mig_secret2
+        except Exception:  # noqa: BLE001
+            retry_ok = False
+        check("migration(rotate): retried migration secret == original",
+              r.status_code == 200 and retry_ok, r.text)
+
+        # --- 并发重复创建：同键 -> 同一会话；异键 -> 恰一个 201 ---------------
+        r = await tenant.call("POST", "/custodies", json={
+            "policy_id": pol_mig_src, "expected_version": 1, "secret_hex": mig_secret.hex()})
+        mig_c3 = r.json()["custody_id"]
+        r = await tenant.call("POST", "/custodies", json={
+            "policy_id": pol_mig_src, "expected_version": 1, "secret_hex": mig_secret.hex()})
+        mig_c3b = r.json()["custody_id"]
+        body_race = {"custody_id": mig_c3, "target_policy_id": pol_mig_tgt,
+                     "target_expected_version": 2, "idempotency_key": f"mig-key-{suffix}-race"}
+        rs = await asyncio.gather(
+            tenant.call("POST", "/migrations", json=body_race),
+            tenant.call("POST", "/migrations", json=body_race),
+        )
+        race_ids = {x.json()["migration_id"] for x in rs}
+        check("migration: concurrent same-key create -> same session, one 201 one 200",
+              sorted(x.status_code for x in rs) == [200, 201] and len(race_ids) == 1,
+              f"{[x.status_code for x in rs]} {race_ids}")
+        rs = await asyncio.gather(
+            tenant.call("POST", "/migrations",
+                        json={**body_race, "custody_id": mig_c3b,
+                              "idempotency_key": f"mig-key-{suffix}-race-a"}),
+            tenant.call("POST", "/migrations",
+                        json={**body_race, "custody_id": mig_c3b,
+                              "idempotency_key": f"mig-key-{suffix}-race-b"}),
+        )
+        check("migration: concurrent different-key create -> exactly one wins",
+              sorted(x.status_code for x in rs) == [201, 409]
+              and any(x.json().get("error", {}).get("code") == "MIGRATION_CONFLICT" for x in rs),
+              f"{[x.status_code for x in rs]}")
+
+        # --- 并发重复提交：恰一次 200，计数不重复 -----------------------------
+        r = await tenant.call("POST", "/custodies", json={
+            "policy_id": pol_mig_src, "expected_version": 1, "secret_hex": mig_secret.hex()})
+        mig_c4 = r.json()["custody_id"]
+        r = await tenant.call("POST", "/migrations", json={
+            "custody_id": mig_c4, "target_policy_id": pol_mig_tgt,
+            "target_expected_version": 2, "idempotency_key": f"mig-key-{suffix}-c4"})
+        mid4 = r.json()["migration_id"]
+        pa4, _ = await mig_prep("alice", mid4)
+        rs = await asyncio.gather(mig_submit("alice", pa4), mig_submit("alice", pa4))
+        check("migration: concurrent duplicate share -> exactly one accepted",
+              sorted(x.status_code for x in rs) == [200, 409],
+              f"{[x.status_code for x in rs]}")
+        r = await tenant.call("GET", f"/migrations/{mid4}")
+        check("migration: no double counting under race",
+              r.json()["shares_received"] == 1, r.text)
+
+        # --- 撤销 / 过期拒绝 --------------------------------------------------
+        r = await tenant.call("POST", "/policies", json={
+            "policy_id": pol_mig_rev, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": epoch_mig})
+        assert r.status_code == 201, r.text
+        r = await tenant.call("POST", f"/policies/{pol_mig_rev}/revoke",
+                              json={"expected_version": 1})
+        assert r.status_code == 200, r.text
+        r = await tenant.call("POST", "/custodies", json={
+            "policy_id": pol_mig_src, "expected_version": 1, "secret_hex": mig_secret.hex()})
+        mig_c5 = r.json()["custody_id"]
+        await expect_error(tenant, "migration: revoked target", "POST", "/migrations",
+                           "EPOCH_REVOKED", json={
+                               "custody_id": mig_c5, "target_policy_id": pol_mig_rev,
+                               "target_expected_version": 1,
+                               "idempotency_key": f"mig-key-{suffix}-c5"})
+        r = await tenant.call("POST", "/policies", json={
+            "policy_id": pol_mig_exp, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": {"valid_from": "2020-01-01T00:00:00Z", "valid_until": "2020-02-01T00:00:00Z",
+                      "rotation_interval": 0}})
+        assert r.status_code == 201, r.text
+        await expect_error(tenant, "migration: expired target", "POST", "/migrations",
+                           "EPOCH_EXPIRED", json={
+                               "custody_id": mig_c5, "target_policy_id": pol_mig_exp,
+                               "target_expected_version": 1,
+                               "idempotency_key": f"mig-key-{suffix}-c6"})
+        # 源策略撤销后其托管记录一律不可再迁移（放最后，避免影响前面用例）
+        r = await tenant.call("POST", f"/policies/{pol_mig_src}/revoke",
+                              json={"expected_version": 1})
+        assert r.status_code == 200, r.text
+        await expect_error(tenant, "migration: revoked source custody", "POST", "/migrations",
+                           "EPOCH_REVOKED", json={
+                               "custody_id": mig_c5, "target_policy_id": pol_mig_tgt,
+                               "target_expected_version": 2,
+                               "idempotency_key": f"mig-key-{suffix}-c7"})
+
         # --- 原子轮换：旧版本不可变且变为 revoked ---------------------------
         new_epoch = {"valid_from": "2027-01-01T00:00:00Z", "valid_until": "2031-01-01T00:00:00Z",
                      "rotation_interval": 0}
@@ -602,11 +1009,17 @@ async def main() -> int:
         check("audit log leaks no secret", secret_hex not in raw and secret.decode() not in raw)
         # 已领取分片明文绝不进审计
         check("audit log leaks no claimed shard", c_alice["shard_hex"] not in raw)
+        check("audit log leaks no migrated secret",
+              mig_secret.hex() not in raw and mig_secret.decode() not in raw
+              and mig_secret2.hex() not in raw and mig_secret2.decode() not in raw)
+        check("audit log leaks no migration-claimed shard", claim_a1["shard_hex"] not in raw)
         actions = {e["action"] for e in chain["entries"]}
         expect_actions = {
             "policy.create", "policy.rotate", "policy.epoch.revoke",
             "custody.create", "recovery.start", "recovery.nonce.issue",
             "recovery.shard.claim", "recovery.share.submit",
+            "migration.start", "migration.challenge.issue", "migration.shard.claim",
+            "migration.share.submit", "migration.complete", "migration.failed",
         }
         check("audit covers key lifecycle actions", expect_actions.issubset(actions),
               str(sorted(expect_actions - actions)))
@@ -618,6 +1031,8 @@ async def main() -> int:
     finally:
         await tenant.close()
         for c in cuds.values():
+            await c.close()
+        for c in extra_clients:
             await c.close()
         await admin.close()
 

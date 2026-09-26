@@ -10,7 +10,7 @@ from .db import Database, wait_for_database
 from .errors import install_exception_handlers
 from .faults import FaultBoard
 from .pending import PendingShareStore
-from .routers import admin, audit_log, custodies, policies, recovery
+from .routers import admin, audit_log, custodies, migrations, policies, recovery
 
 
 async def _pending_sweeper(app: FastAPI) -> None:
@@ -44,8 +44,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多方密钥分片托管与门限恢复 API",
-    version="1.3.0",
-    description="不可变策略 + Shamir n-of-m 分片 + 门限恢复（提交本人分片，一次性密文）",
+    version="1.4.0",
+    description="不可变策略 + Shamir n-of-m 分片 + 门限恢复（提交本人分片，一次性密文）+ 跨策略密钥迁移",
     lifespan=lifespan,
 )
 install_exception_handlers(app)
@@ -54,6 +54,7 @@ app.include_router(admin.router)
 app.include_router(policies.router)
 app.include_router(custodies.router)
 app.include_router(recovery.router)
+app.include_router(migrations.router)
 app.include_router(audit_log.router)
 
 

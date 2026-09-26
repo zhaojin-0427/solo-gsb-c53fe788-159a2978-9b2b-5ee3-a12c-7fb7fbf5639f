@@ -26,6 +26,11 @@ Scenarios:
       retry completes and emits the wrap exactly once.
   U1  PendingShareStore token-scoped discard unit checks (stale token can never
       evict a newer committed share, even if lock ordering were disturbed).
+  M1  migration terminal failure: pending shares lost (simulated restart) at
+      threshold -> deterministic THRESHOLD_NOT_MET, the session is committed
+      ``failed`` in the same transaction (replayable audit), further operations
+      get MIGRATION_FAILED, the same idempotency key replays the failed session,
+      and a fresh key retries safely to completion.
 """
 from __future__ import annotations
 
@@ -488,6 +493,107 @@ async def scenario_r4(hs: Harness, pending: PendingShareStore, board) -> None:
     check(f"{label}: ciphertext delivered exactly once", len([w for w in wraps if w]) == 1)
 
 
+async def scenario_m1(hs: Harness, pending: PendingShareStore, board) -> None:
+    """Migration terminal failure & safe retry.
+
+    Alice's verified share is committed (1/2) and lives only in the in-memory
+    pool; a simulated restart wipes the pool. Bob's submit then reaches the
+    source threshold with insufficient in-memory shares: the service must
+    answer a deterministic THRESHOLD_NOT_MET, commit the session as ``failed``
+    in the same transaction (replayable audit), reject further operations with
+    MIGRATION_FAILED, replay the failed session for the same idempotency key,
+    and let a fresh key retry to completion.
+    """
+    label = "M1(migration-terminal-fail-retry)"
+    suffix = os.urandom(4).hex()
+    pol_src = f"pol_mig_race_src_{suffix}"
+    pol_tgt = f"pol_mig_race_tgt_{suffix}"
+    th = auth(hs.http, hs.tenant_key)
+    epoch = {"valid_from": "2026-01-01T00:00:00Z", "valid_until": "2035-01-01T00:00:00Z",
+             "rotation_interval": 0}
+    for pol in (pol_src, pol_tgt):
+        r = await hs.http.post("/policies", headers=th, json={
+            "policy_id": pol, "threshold": 2,
+            "custodian_ids": ["cus_demo_alice", "cus_demo_bob", "cus_demo_carol"],
+            "epoch": epoch})
+        assert r.status_code == 201, r.text
+    r = await hs.http.post("/custodies", headers=th, json={
+        "policy_id": pol_src, "expected_version": 1, "secret_hex": hs.secret.hex()})
+    assert r.status_code == 201, r.text
+    custody_id = r.json()["custody_id"]
+
+    async def mig_prep(name: str, mid: str) -> dict:
+        h = hs.h(name)
+        r = await hs.http.post("/migrations/challenges", headers=h, json={"migration_id": mid})
+        assert r.status_code == 200, r.text
+        nonce = r.json()["nonce"]
+        r = await hs.http.post("/migrations/shards/claim", headers=h,
+                               json={"migration_id": mid, "nonce": nonce})
+        assert r.status_code == 200, r.text
+        c = r.json()
+        return {"migration_id": mid, "nonce": nonce, "point_x": c["point_x"],
+                "shard_hex": c["shard_hex"],
+                "signature": sign(hs.cust[name]["signing_private_key"], c["signing_message"])}
+
+    r = await hs.http.post("/migrations", headers=th, json={
+        "custody_id": custody_id, "target_policy_id": pol_tgt,
+        "target_expected_version": 1, "idempotency_key": f"mig-race-{suffix}-1"})
+    assert r.status_code == 201, r.text
+    mid = r.json()["migration_id"]
+    pa = await mig_prep("alice", mid)
+    pb = await mig_prep("bob", mid)
+    r = await hs.http.post("/migrations/shares", headers=hs.h("alice"), json=pa)
+    check(f"{label}: alice share committed (1/2)",
+          r.status_code == 200 and body_of(r).get("shares_received") == 1, r.text)
+
+    # 模拟进程重启：内存待累计分片丢失（数据库提交计数保留）
+    pending.clear(mid)
+    r = await hs.http.post("/migrations/shares", headers=hs.h("bob"), json=pb)
+    err = body_of(r).get("error", {})
+    check(f"{label}: threshold submit with lost pending -> THRESHOLD_NOT_MET",
+          r.status_code == 409 and err.get("code") == "THRESHOLD_NOT_MET"
+          and err.get("basis", {}).get("reason") == "pending_shares_unavailable",
+          f"HTTP {r.status_code}: {r.text[:200]}")
+    row = await hs.pool.fetchrow(
+        "SELECT status, fail_reason FROM migration_sessions WHERE id=$1", mid)
+    check(f"{label}: session committed failed in the same transaction",
+          row["status"] == "failed" and row["fail_reason"] == "pending_shares_unavailable",
+          f"{dict(row)}")
+    r = await hs.http.post("/migrations/challenges", headers=hs.h("carol"),
+                           json={"migration_id": mid})
+    check(f"{label}: challenge on failed session -> MIGRATION_FAILED",
+          r.status_code == 409
+          and body_of(r).get("error", {}).get("code") == "MIGRATION_FAILED",
+          f"HTTP {r.status_code}: {r.text[:200]}")
+
+    # 同幂等键重放返回该（失败）会话；新幂等键安全重试直至完成
+    r = await hs.http.post("/migrations", headers=th, json={
+        "custody_id": custody_id, "target_policy_id": pol_tgt,
+        "target_expected_version": 1, "idempotency_key": f"mig-race-{suffix}-1"})
+    check(f"{label}: same idempotency key replays the failed session",
+          r.status_code == 200 and body_of(r).get("status") == "failed", r.text)
+    r = await hs.http.post("/migrations", headers=th, json={
+        "custody_id": custody_id, "target_policy_id": pol_tgt,
+        "target_expected_version": 1, "idempotency_key": f"mig-race-{suffix}-2"})
+    check(f"{label}: fresh idempotency key retries after terminal failure",
+          r.status_code == 201 and body_of(r).get("status") == "open", r.text)
+    mid2 = r.json()["migration_id"]
+    pa2 = await mig_prep("alice", mid2)
+    pb2 = await mig_prep("bob", mid2)
+    r = await hs.http.post("/migrations/shares", headers=hs.h("alice"), json=pa2)
+    assert r.status_code == 200, r.text
+    r = await hs.http.post("/migrations/shares", headers=hs.h("bob"), json=pb2)
+    b2 = body_of(r)
+    check(f"{label}: retried migration completes with a new custody id",
+          r.status_code == 200 and b2.get("completed") and b2.get("result_custody_id"),
+          r.text)
+    rows = await hs.pool.fetch(
+        "SELECT action FROM audit_log WHERE resource IN ($1, $2) ORDER BY seq", mid, mid2)
+    actions = [x["action"] for x in rows]
+    check(f"{label}: audit chain replays failure + retry",
+          "migration.failed" in actions and "migration.complete" in actions, str(actions))
+
+
 def unit_pending_store() -> None:
     label = "U1(token-scoped discard)"
     store = PendingShareStore()
@@ -521,6 +627,7 @@ async def amain() -> int:
         await scenario_r2(hs, pending, board)
         await scenario_r5(hs, pending, board)
         await scenario_r4(hs, pending, board)
+        await scenario_m1(hs, pending, board)
 
     failed = [n for n, ok, _ in results if not ok]
     print("\n" + "=" * 70)

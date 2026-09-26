@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -195,6 +196,82 @@ def custodian_signing_message(
         f"policy={policy_id}",
         f"version={policy_version}",
         f"session={session_id}",
+        f"nonce={nonce}",
+        f"point={point_x}",
+        f"shard_digest={shard_digest}",
+    ]
+    return "\n".join(fields).encode()
+
+
+# ---------------------------------------------------------------------------
+# Cross-policy migration
+# ---------------------------------------------------------------------------
+
+def policy_version_digest(
+    *,
+    policy_id: str,
+    version: int,
+    tenant_id: str,
+    threshold: int,
+    custodian_ids: list[str],
+    epoch_index: int,
+    epoch_valid_from,
+    epoch_valid_until,
+    rotation_interval: int,
+) -> str:
+    """Canonical digest of one immutable policy version.
+
+    A migration session pins itself to the exact source/target versions via
+    this digest; custodian signatures and audit entries bind it too. Only the
+    immutable parameters are covered — ``status`` is excluded (rotation flips
+    it); liveness is enforced separately at every step of the flow.
+    """
+    from .audit import canon_ts  # 局部导入：避免模块级环（audit 不依赖 crypto）
+
+    payload = {
+        "policy_id": policy_id,
+        "version": version,
+        "tenant_id": tenant_id,
+        "threshold": threshold,
+        "custodian_ids": list(custodian_ids),
+        "epoch_index": epoch_index,
+        "epoch_valid_from": canon_ts(epoch_valid_from),
+        "epoch_valid_until": canon_ts(epoch_valid_until),
+        "rotation_interval": rotation_interval,
+    }
+    return sha256_hex(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+
+
+# Canonical message a custodian signs when contributing its shard to a
+# migration.  It binds the one-time challenge, the migration session, the
+# source custody and the digests of BOTH policy versions, so a signature can
+# never be replayed against a different migration, custody or policy version.
+def migration_signing_message(
+    *,
+    nonce: str,
+    migration_id: str,
+    custody_id: str,
+    source_policy_id: str,
+    source_policy_version: int,
+    target_policy_id: str,
+    target_policy_version: int,
+    source_policy_digest: str,
+    target_policy_digest: str,
+    custodian_id: str,
+    point_x: int,
+    shard_digest: str,
+) -> bytes:
+    fields = [
+        "keyvault.migration.share.v1",
+        f"custodian={custodian_id}",
+        f"migration={migration_id}",
+        f"custody={custody_id}",
+        f"source_policy={source_policy_id}",
+        f"source_version={source_policy_version}",
+        f"target_policy={target_policy_id}",
+        f"target_version={target_policy_version}",
+        f"source_digest={source_policy_digest}",
+        f"target_digest={target_policy_digest}",
         f"nonce={nonce}",
         f"point={point_x}",
         f"shard_digest={shard_digest}",

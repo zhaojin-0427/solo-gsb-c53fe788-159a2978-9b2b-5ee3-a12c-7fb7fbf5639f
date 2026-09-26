@@ -117,6 +117,56 @@ CREATE INDEX IF NOT EXISTS idx_share_session ON share_submissions(session_id);
 ALTER TABLE share_submissions ADD COLUMN IF NOT EXISTS point_x INTEGER;
 ALTER TABLE share_submissions ADD COLUMN IF NOT EXISTS shard_digest TEXT;
 
+-- 跨策略迁移会话：绑定源/目标策略版本摘要；同一托管记录至多一个未失败会话，
+-- 不同幂等键不得重复迁移；failed 终态后可用新幂等键安全重试。
+CREATE TABLE IF NOT EXISTS migration_sessions (
+    id                    TEXT PRIMARY KEY,
+    tenant_id             TEXT NOT NULL REFERENCES tenants(id),
+    custody_id            TEXT NOT NULL REFERENCES key_custodies(id),
+    idempotency_key       TEXT NOT NULL,
+    source_policy_id      TEXT NOT NULL,
+    source_policy_version INTEGER NOT NULL,
+    source_policy_digest  TEXT NOT NULL,     -- 源策略版本规范摘要（不可变参数）
+    target_policy_id      TEXT NOT NULL,
+    target_policy_version INTEGER NOT NULL,
+    target_policy_digest  TEXT NOT NULL,     -- 目标策略版本规范摘要
+    secret_digest         TEXT NOT NULL,     -- 绑定源托管的秘密摘要（重组校验）
+    status                TEXT NOT NULL DEFAULT 'open',  -- open | completed | failed
+    fail_reason           TEXT,
+    result_custody_id     TEXT REFERENCES key_custodies(id),
+    valid_until           TIMESTAMPTZ NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, idempotency_key)      -- 幂等键：同键重放返回同一会话
+);
+-- 部分唯一索引：同一托管记录最多一个 open/completed 会话（failed 不占位，可重试）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_migration_live_per_custody
+    ON migration_sessions (custody_id) WHERE status IN ('open', 'completed');
+CREATE INDEX IF NOT EXISTS idx_migration_tenant ON migration_sessions(tenant_id);
+
+-- 迁移一次性挑战值（与恢复 nonce 同构：库中只存摘要，每会话每托管人至多一张）。
+CREATE TABLE IF NOT EXISTS migration_challenges (
+    id            TEXT PRIMARY KEY,
+    migration_id  TEXT NOT NULL REFERENCES migration_sessions(id) ON DELETE CASCADE,
+    custodian_id  TEXT NOT NULL,
+    nonce_hash    TEXT NOT NULL UNIQUE,
+    spent         BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (migration_id, custodian_id)
+);
+
+-- 迁移分片提交登记（只存点位与摘要，绝不存明文）。
+CREATE TABLE IF NOT EXISTS migration_submissions (
+    id              TEXT PRIMARY KEY,
+    migration_id    TEXT NOT NULL REFERENCES migration_sessions(id) ON DELETE CASCADE,
+    custodian_id    TEXT NOT NULL,
+    challenge_id    TEXT NOT NULL REFERENCES migration_challenges(id),
+    point_x         INTEGER NOT NULL,
+    shard_digest    TEXT NOT NULL,
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (migration_id, custodian_id)
+);
+CREATE INDEX IF NOT EXISTS idx_migsub_migration ON migration_submissions(migration_id);
+
 -- 仅追加、哈希链审计日志（不含任何秘密材料）。
 CREATE TABLE IF NOT EXISTS audit_log (
     seq          BIGSERIAL PRIMARY KEY,

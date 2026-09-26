@@ -29,6 +29,8 @@ E_THRESHOLD_NOT_MET = "THRESHOLD_NOT_MET"
 E_INTEGRITY = "INTEGRITY_CHECK_FAILED"
 E_SHARE_POINT = "SHARE_POINT_MISMATCH"
 E_SHARE_DIGEST = "SHARE_DIGEST_MISMATCH"
+E_MIGRATION_CONFLICT = "MIGRATION_CONFLICT"
+E_MIGRATION_FAILED = "MIGRATION_FAILED"
 E_RATE_LIMITED = "RATE_LIMITED"
 E_INTERNAL = "INTERNAL_ERROR"
 
@@ -53,6 +55,8 @@ _STATUS = {
     E_INTEGRITY: 409,
     E_SHARE_POINT: 400,
     E_SHARE_DIGEST: 400,
+    E_MIGRATION_CONFLICT: 409,
+    E_MIGRATION_FAILED: 409,
     E_RATE_LIMITED: 400,
     E_INTERNAL: 500,
 }
@@ -78,6 +82,8 @@ _MESSAGES = {
     E_INTEGRITY: "stored digest mismatch; secret or shard integrity violated",
     E_SHARE_POINT: "submitted shard point does not match this custodian's assigned point",
     E_SHARE_DIGEST: "digest of submitted shard does not match inventory digest for this custodian",
+    E_MIGRATION_CONFLICT: "custody already has a non-failed migration session, or the idempotency key was reused with different parameters",
+    E_MIGRATION_FAILED: "migration session has failed terminally; start a new one with a fresh idempotency key",
     E_RATE_LIMITED: "too many requests",
     E_INTERNAL: "internal error",
 }
