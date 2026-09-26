@@ -23,6 +23,11 @@ Gate names used by the share-submit flow:
 * ``submit.after_lock`` — immediately after acquiring the session row lock.
 * ``submit.before_reconstruct`` — threshold reached, right before combining.
 
+The same gates exist for the cross-policy migration share flow under the
+``migration.*`` prefix (``migration.after_lock`` / ``migration.after_add`` /
+``migration.before_resplit``), pinning the identical rollback/lock interleaving
+on in-memory source-shard accumulation and target re-sharding.
+
 Header protocol (only honored when fault injection is enabled):
 
 * ``X-Fault-Gate: <name>``        park at that gate until released

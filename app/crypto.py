@@ -203,7 +203,77 @@ def custodian_signing_message(
 
 
 # ---------------------------------------------------------------------------
-# One-time recovery wrap: X25519 ephemeral ECDH -> HKDF -> AES-256-GCM
+# Cross-policy migration
+# ---------------------------------------------------------------------------
+
+# 迁移会话/签名全程绑定的不可变策略版本摘要：对版本行全部不变要素做规范化哈希。
+# 迁移会话创建时把源/目标摘要固化下来，此后每个关口复核——即使底层数据异常，
+# 迁移也不会在“换了一个版本”的情况下继续。
+def policy_version_digest(
+    *,
+    policy_id: str,
+    version: int,
+    tenant_id: str,
+    threshold: int,
+    custodian_ids: list[str],
+    epoch_index: int,
+    epoch_valid_from: str,
+    epoch_valid_until: str,
+    rotation_interval: int,
+) -> str:
+    import json
+
+    canonical = json.dumps(
+        {
+            "protocol": "keyvault.policy.v1",
+            "policy_id": policy_id,
+            "version": version,
+            "tenant_id": tenant_id,
+            "threshold": threshold,
+            "custodian_ids": list(custodian_ids),
+            "epoch_index": epoch_index,
+            "epoch_valid_from": epoch_valid_from,
+            "epoch_valid_until": epoch_valid_until,
+            "rotation_interval": rotation_interval,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+# 迁移专用签名报文（与恢复的 keyvault.share.v2 区分，杜绝跨协议重放）：
+# 逐行绑定 迁移会话/源策略版本摘要/目标策略版本摘要/nonce/托管人/点位/分片摘要。
+def migration_signing_message(
+    *,
+    nonce: str,
+    migration_id: str,
+    source_policy_id: str,
+    source_version: int,
+    source_digest: str,
+    target_policy_id: str,
+    target_version: int,
+    target_digest: str,
+    custodian_id: str,
+    point_x: int,
+    shard_digest: str,
+) -> bytes:
+    fields = [
+        "keyvault.migration.v1",
+        f"migration={migration_id}",
+        f"custodian={custodian_id}",
+        f"source_policy={source_policy_id}",
+        f"source_version={source_version}",
+        f"source_digest={source_digest}",
+        f"target_policy={target_policy_id}",
+        f"target_version={target_version}",
+        f"target_digest={target_digest}",
+        f"nonce={nonce}",
+        f"point={point_x}",
+        f"shard_digest={shard_digest}",
+    ]
+    return "\n".join(fields).encode()
 # Returned ciphertext can only be unwrapped by the requester's private key.
 # ---------------------------------------------------------------------------
 WRAP_PREFIX = b"KWR1"

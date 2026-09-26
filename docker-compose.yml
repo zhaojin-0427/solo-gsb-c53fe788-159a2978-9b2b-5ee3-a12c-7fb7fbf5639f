@@ -34,7 +34,7 @@ services:
       retries: 20
 
   # 一键跑完整验收（并发回滚竞态回归 + 正常恢复 + 各类拒绝依据 + 并发重放
-  # + 审计重放）：
+  # + 跨策略密钥迁移 + 审计重放）：
   #   docker compose --profile demo run --rm demo
   demo:
     build: .

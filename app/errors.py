@@ -31,6 +31,13 @@ E_SHARE_POINT = "SHARE_POINT_MISMATCH"
 E_SHARE_DIGEST = "SHARE_DIGEST_MISMATCH"
 E_RATE_LIMITED = "RATE_LIMITED"
 E_INTERNAL = "INTERNAL_ERROR"
+# 跨策略密钥迁移
+E_IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+E_MIGRATION_TARGET_INVALID = "MIGRATION_TARGET_INVALID"
+E_MIGRATION_SOURCE_INVALID = "MIGRATION_SOURCE_INVALID"
+E_MIGRATION_DIGEST_MISMATCH = "MIGRATION_DIGEST_MISMATCH"
+E_MIGRATION_CONFLICT = "MIGRATION_CONFLICT"
+E_MIGRATION_COMPLETED = "MIGRATION_COMPLETED"
 
 _STATUS = {
     E_BAD_REQUEST: 400,
@@ -55,6 +62,12 @@ _STATUS = {
     E_SHARE_DIGEST: 400,
     E_RATE_LIMITED: 400,
     E_INTERNAL: 500,
+    E_IDEMPOTENCY_CONFLICT: 409,
+    E_MIGRATION_TARGET_INVALID: 409,
+    E_MIGRATION_SOURCE_INVALID: 409,
+    E_MIGRATION_DIGEST_MISMATCH: 409,
+    E_MIGRATION_CONFLICT: 409,
+    E_MIGRATION_COMPLETED: 409,
 }
 
 _MESSAGES = {
@@ -80,6 +93,12 @@ _MESSAGES = {
     E_SHARE_DIGEST: "digest of submitted shard does not match inventory digest for this custodian",
     E_RATE_LIMITED: "too many requests",
     E_INTERNAL: "internal error",
+    E_IDEMPOTENCY_CONFLICT: "idempotency key is already bound to a different request",
+    E_MIGRATION_TARGET_INVALID: "target policy version is revoked, expired, cross-tenant or identical to the source",
+    E_MIGRATION_SOURCE_INVALID: "source custody record is not valid for migration (not active or its policy version revoked/expired)",
+    E_MIGRATION_DIGEST_MISMATCH: "bound source/target policy version digest no longer matches the immutable record",
+    E_MIGRATION_CONFLICT: "a different open migration already exists for this custody, or the same custody is already migrated",
+    E_MIGRATION_COMPLETED: "migration session is already completed",
 }
 
 

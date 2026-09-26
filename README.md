@@ -1,4 +1,4 @@
-# 多方密钥分片托管与门限恢复 API
+# 多方密钥分片托管、门限恢复与跨策略迁移 API
 
 租户把待托管密钥交给服务后，服务按 **Shamir 门限秘密分享 (n-of-m)** 切成多份，每份独立加密落盘，
 任何单一托管人（甚至数据库运维）都无法还原秘密。恢复时托管人须**先经身份验证领取本人分片**，
@@ -7,7 +7,30 @@
 这些已验签的提交分片在请求内存中重组**（服务端不再解密自己的库存分片来凑数），并用恢复方临时公钥
 包装成**一次性密文**返回。
 
+v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定另一条有效策略版本、携带**幂等键**创建
+迁移会话（会话固化源/目标**策略版本摘要**）；旧策略托管人按一次性挑战值领取并提交本人分片及签名，
+达到**源门限**后秘密仅在内存重组、**立即按目标策略重新分片**，在**同一事务**写入新托管记录并返回
+其标识——**源记录保持不变**；响应、数据库与审计全程无明文。
+
 技术栈：Python 3.12 · FastAPI · PostgreSQL 16 · `cryptography` · Docker Compose。
+
+> **新功能（v1.4）跨策略密钥迁移**：在不改写、不删除源托管记录的前提下，把一份托管秘密迁移到
+> **另一条有效策略版本**（可同时更换托管人集合与门限）。租户 `POST /migrations`（必须带
+> `Idempotency-Key` 头）创建会话，响应固化 `source_digest/target_digest`（不可变策略版本行的
+> 规范化 SHA256）。旧策略托管人走与恢复同构的 **nonce → claim → sign → submit** 流程，但签名报文
+> 换成迁移专用的 `keyvault.migration.v1`，逐行绑定
+> 迁移会话/源版本摘要/目标版本摘要/nonce/托管人/点位/分片摘要。达到源门限的那一次提交：
+> ① 秘密**只由已验签提交分片**在请求内存中插值重组（服务端不碰库存分片），校验 `secret_digest`；
+> ② **立即**按目标策略 `shamir_split` 并逐片 AES-GCM 加密；③ 新 `key_custodies` + 新 `shards`、
+> 会话置 `completed`、审计 `migration.complete` **同一事务**提交，源 custody/shards 一行不改。
+> 幂等与并发：幂等键只存 `sha256`；同键同请求重放返回同一会话（200，完成态含同一新 custody），
+> 同键不同请求 `IDEMPOTENCY_CONFLICT`；不同键迁移同一 custody 一律 `MIGRATION_CONFLICT`
+> （`open_migration_exists_for_custody` / `custody_already_migrated`），由源 custody 行锁 +
+> 部分唯一索引兜底，**不同幂等键绝不可能把同一记录迁移两次**。源/目标被撤销或过期、跨租户、
+> 目标=源均被拒；会话 TTL 或源侧失效后旧 open 会话惰性置 `expired`，调用方可安全重试。
+> 确定性拒绝（验签/点位/摘要/nonce/成员）不花费 nonce；入池后的失败沿用 v1.3 的双重撤销边界
+> （行锁释放前先凭 token 撤回内存分片再回滚）。端到端与存储层断言见 `scripts/demo.py`
+> （108 项，迁移用例覆盖正常流程、每类拒绝依据、并发重复、TTL 安全重试与存储层无明文）。
 
 > **修复要点（v1.3）**：修复 `/recoveries/shares` 在“分片**已入内存池之后**异常回滚”时的交错竞态
 > （重组失败、审计写入失败、连接中止等）。旧代码在异常路径上**先 `ROLLBACK` 释放会话行锁、
@@ -75,11 +98,11 @@ docker compose exec api python -m app.seed
 
 ## 2. 快速体验（端到端）
 
-容器自带完整验收脚本，覆盖正常恢复、每一种拒绝依据、并发竞态与审计链重放：
+容器自带完整验收脚本，覆盖正常恢复、每一种拒绝依据、并发竞态、跨策略迁移与审计链重放：
 
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
-# 2) 端到端验收（scripts.demo，64 项）
+# 2) 端到端验收（scripts.demo，108 项）
 docker compose --profile demo run --rm demo
 ```
 
@@ -193,6 +216,76 @@ curl -s -X POST localhost:8000/recoveries/shares \
 > 待累计分片**只存进程内存**（`app/pending.py`），不写库、不写日志、不进审计；进程重启后内存清空，
 > 已计数的会话无法继续重组，需另开恢复会话（提交接口此时返回 `THRESHOLD_NOT_MET`，basis.reason 为
 > `pending_shares_unavailable`）。这是本演示基线在“明文不落盘”与“多副本部署”之间的明确取舍。
+> 迁移会话的待累计源分片复用同一内存池（以 migration_id 为键），语义完全相同。
+
+### 2.9 跨策略密钥迁移（curl 流程）
+
+目标：把一份仍有效托管（源策略 `pol_main:v1`，2-of-3）迁移到**另一条有效策略版本**
+（`pol_next:v1`，可换托管人集合/门限）。源记录全程保持 `active` 不变。
+
+```bash
+TENANT=tsec_...   # python -m app.seed 输出
+
+# (1) 租户创建迁移会话：必须带 Idempotency-Key；绑定源 custody 与目标策略版本
+curl -s -X POST localhost:8000/migrations -H "X-API-Key: $TENANT" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: migrate-2026-09-26-0001' -d '{
+    "source_custody_id":"cus_secret_...",
+    "target_policy_id":"pol_next",
+    "target_version":1,
+    "ttl_seconds":300
+  }'
+# -> migration_id、source_digest/target_digest（不可变版本行摘要）、status=open、threshold(源门限)
+#    同键同体重放返回 200 + 同一会话（不新建、不重复留痕）；首次创建为 201
+
+# (2) 源策略托管人领取一次性挑战值（与恢复同构）
+curl -s -X POST localhost:8000/migrations/nonces -H "X-API-Key: $CUSTODIAN_KEY" \
+  -H 'Content-Type: application/json' -d '{"migration_id":"mig_..."}'
+# -> nonce + point_x + shard_digest + source/target_digest
+
+# (3) 托管人领取本人“源分片”（明文仅在本次响应出现，不落盘/不入审计）
+curl -s -X POST localhost:8000/migrations/shards/claim -H "X-API-Key: $CUSTODIAN_KEY" \
+  -H 'Content-Type: application/json' -d '{"migration_id":"mig_...","nonce":"..."}'
+# -> shard_hex + signing_message（keyvault.migration.v1：逐行绑定
+#    migration/source_digest/target_digest/nonce/custodian/point/shard_digest）
+
+# (4) 托管人本地 Ed25519 签名后，提交本人源分片 + 签名
+curl -s -X POST localhost:8000/migrations/shares -H "X-API-Key: $CUSTODIAN_KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "migration_id":"mig_...","nonce":"...","point_x":1,
+    "shard_hex":"<领取到的本人源分片 hex>","signature":"<64B ed25519 hex>"}'
+
+# (5) 达到源门限的那一次（如 2-of-3 的第 2 份）：
+# -> completed=true、new_custody_id、new_shard_count、new_shard_digests[]
+#    服务端仅用已验签源分片在内存重组 -> 立即按目标策略重新分片 ->
+#    新托管记录 + 新加密分片在同一事务写入；源 custody/shards 一行未改，
+#    响应不含秘密或分片明文。新记录此后即可按目标策略正常 POST /recoveries。
+
+# 查询迁移会话（幂等/排障）
+curl -s localhost:8000/migrations/mig_... -H "X-API-Key: $TENANT"
+# -> status(open|completed|expired)、shares_received、threshold、new_custody_id
+```
+
+**迁移的拒绝与重试语义**：
+
+- 必须携带 `Idempotency-Key`（缺失/超长 → `BAD_REQUEST`）；幂等键与 nonce 都只存 SHA256 摘要。
+- 同键不同请求体（换源 custody 或换目标版本）→ `IDEMPOTENCY_CONFLICT`；
+  不同幂等键迁移同一 custody → `MIGRATION_CONFLICT`
+ （`open_migration_exists_for_custody` / `custody_already_migrated`）——
+  完成迁移的 custody 再用任何键发起都会被拒，**不同键不可能迁移两次**。
+- 源 custody 非 active 或源版本已撤销/过期 → `MIGRATION_SOURCE_INVALID`；
+  目标版本不存在、已撤销、已过期、属于别的租户、或与源完全相同 →
+  `MIGRATION_TARGET_INVALID` / `FORBIDDEN`。
+- 托管人侧拒绝码与恢复一致：非源策略成员 `CROSS_POLICY_SHARE`、验签失败 `BAD_SIGNATURE`、
+  点位/摘要不符 `SHARE_POINT_MISMATCH`/`SHARE_DIGEST_MISMATCH`（均不花费 nonce）、
+  nonce 重放 `NONCE_ALREADY_USED`、重复提交 `DUPLICATE_SHARE`、
+  会话完成 `MIGRATION_COMPLETED`、会话 TTL 失效或源侧在途被撤销/过期
+  `SESSION_EXPIRED` / `EPOCH_REVOKED` / `EPOCH_EXPIRED`。
+- 每次 nonce/claim/submit 都重新校验源/目标**版本摘要**与会话绑定一致，
+  若不可变版本行与固化摘要不符 → `MIGRATION_DIGEST_MISMATCH`（完整性兜底）。
+- 会话超过 TTL、或源侧在途失效后，旧 open 会话在该 custody 下一次请求时被惰性置 `expired`，
+  随后可用同一幂等键（也可用新键）安全重试；确定性 4xx 不花费 nonce，可直接用原 nonce 重领重试。
+- 并发创建由源 custody 行锁串行化 + 部分唯一索引兜底：同键并发恰有一次 201、另一次重放 200；
+  不同键并发恰有一次 201、另一次 `MIGRATION_CONFLICT`。
 
 轮换 / 撤销：
 
@@ -229,6 +322,11 @@ curl -s localhost:8000/audit/replay -H "X-API-Key: $TENANT"
 | `POST /recoveries/nonces` | 托管人 | 领取一次性 nonce（含本人分片点位与摘要） |
 | `POST /recoveries/shards/claim` | 托管人 | 验身份后领取**本人分片**明文 + 待签名报文（绑定 nonce） |
 | `POST /recoveries/shares` | 托管人 | 提交**本人分片点位+字节**与 Ed25519 签名；门限满足时返回一次性密文 |
+| `POST /migrations` | 租户 | 携带 `Idempotency-Key` 创建跨策略迁移会话（绑定源/目标策略版本摘要） |
+| `GET /migrations/{id}` | 租户 | 查询迁移状态、已收源分片数、完成后的新托管记录标识 |
+| `POST /migrations/nonces` | 托管人 | 领取迁移一次性挑战值 nonce（仅源策略成员） |
+| `POST /migrations/shards/claim` | 托管人 | 验身份后领取**本人源分片**明文 + 迁移待签名报文 |
+| `POST /migrations/shares` | 托管人 | 提交本人源分片+签名；源门限满足时同事务按目标策略重新分片并返回新 custody |
 | `GET /audit/replay` | 租户 | 重放哈希链并验证完整性 |
 
 所有拒绝响应结构统一且确定性：
@@ -258,6 +356,12 @@ curl -s localhost:8000/audit/replay -H "X-API-Key: $TENANT"
 | `CROSS_POLICY_SHARE` | 托管人不属于该策略版本，或 nonce/领取/提交绑定的会话、托管人不匹配 |
 | `SESSION_COMPLETED` / `SESSION_EXPIRED` | 会话已完成（密文只下发一次）/ 已过 TTL |
 | `THRESHOLD_NOT_MET` / `INTEGRITY_CHECK_FAILED` | 有效分片不足（含重启后内存待累计分片丢失 `pending_shares_unavailable`）/ 重组结果摘要不匹配 |
+| `IDEMPOTENCY_CONFLICT` | `Idempotency-Key` 已绑定另一个不同的迁移请求，或同键并发正在创建 |
+| `MIGRATION_TARGET_INVALID` | 目标策略版本不存在、已撤销/已过期、属于其他租户，或与源版本相同 |
+| `MIGRATION_SOURCE_INVALID` | 源托管记录非 active（已轮换/撤销）或源策略版本已撤销/过期，不能发起迁移 |
+| `MIGRATION_DIGEST_MISMATCH` | 会话绑定的源/目标策略版本摘要与不可变版本行不符（完整性兜底） |
+| `MIGRATION_CONFLICT` | 同一 custody 存在其他 open 迁移会话，或该 custody 已迁移完成（不同幂等键不得重复迁移） |
+| `MIGRATION_COMPLETED` | 迁移会话已完成（新托管记录只生成一次） |
 
 ---
 
@@ -312,12 +416,36 @@ X25519 临时 ECDH + HKDF + AES-GCM 包装 → 同事务把会话置 `completed`
 密文不再可获取（重复提交、撤销、并发下都只返回这一次）。
 AAD 绑定会话全部要素，密文无法被挪到别的会话复用。待累计分片明文绝不落盘（见 `app/pending.py`）。
 
+**跨策略密钥迁移（v1.4）**
+迁移会话 `migration_sessions` 与恢复表结构同构（独立的 `migration_nonces` /
+`migration_share_submissions`），额外固化 `source_digest/target_digest` 与只存摘要的
+`idempotency_key_hash`。三重部分唯一约束保证“不重复迁移”：
+
+- `UNIQUE(tenant_id, idempotency_key_hash) WHERE status='open'`：同键有效会话唯一；
+- `UNIQUE(source_custody_id) WHERE status='open'`：同一 custody 至多一个进行中迁移；
+- `UNIQUE(source_custody_id) WHERE new_custody_id IS NOT NULL`：已迁移 custody 全局唯一。
+
+创建在源 custody 行 `FOR UPDATE` 锁内完成，并发被串行化，索引再兜底。每个关口（nonce/claim/submit）
+都在迁移行锁内重新校验：会话未完成/未过期、绑定的源/目标**版本摘要**与不可变版本行逐字节一致、
+源与目标版本均未撤销/未过期、提交者确属**源**策略成员。签名协议独立为 `keyvault.migration.v1`，
+与恢复报文互不兼容，签名逐行绑定源/目标摘要，无法把迁移签名挪去恢复、也无法跨目标版本重放。
+
+门限达成后的关键路径与恢复同样严格：秘密**只由已验签提交源分片在请求栈内存插值**得到
+（绝不解密库存源分片凑数），校验 `secret_digest` 后**立即**按目标策略重新 `shamir_split`、
+逐片以独立 HKDF 密钥 AES-GCM 加密；随后 **新 `key_custodies` + 新 `shards` + 会话置 completed +
+`migration.complete` 审计** 在**同一事务**提交，重组秘密在作用域结束即丢弃。源 custody 与源 shards
+**一行不改**（不 UPDATE 状态、不删除、不置 rotated）；迁移不改变源记录，源门限恢复仍可独立进行。
+入池后失败沿用 v1.3 双重撤销边界；TTL 或源侧失效的 open 会话在同源下一次创建时惰性置 `expired`
+以释放唯一索引，之后同键/新键均可安全重试。幂等重放（含完成态）返回 200 与同一新 custody 标识，
+迁移全过程的响应、数据库与审计只出现 ID、版本摘要、点位和分片/秘密摘要，不出现任何明文。
+
 **审计：按序、可重放、不泄密**
 `audit_log` 仅追加，每条记录 `seq`（事务级 advisory lock 串行分配）与
 `entry_hash = SHA256(规范字段 || prev_hash)`，形成哈希链；`GET /audit/replay`
 逐条复算并报告首个断裂点。审计内容只含 ID、版本、epoch、**分片点位与摘要**、计数等事实，
 写入口还会按字段名（secret/private/ciphertext/plaintext/share_blob/nonce/key…）二次过滤，
-拒绝事件同样留痕。
+拒绝事件同样留痕（含 `migration.start/nonce.issue/shard.claim/share.submit/complete`
+及其 denied 记录）。
 
 ---
 
@@ -329,7 +457,7 @@ pip install -r requirements.txt
 # 准备一个 PostgreSQL 16，设置 KEYVAULT_DATABASE_URL 后：
 python -m app.seed                      # 建表 + 演示身份
 uvicorn app.main:app --reload --port 8000
-KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收
+KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收（含跨策略迁移，108 项）
 KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_recovery           # 并发回滚竞态回归
 ```
 
